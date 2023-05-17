@@ -1,5 +1,8 @@
-use anyhow::{anyhow, bail, Result};
-use std::io::Read;
+use std::io::ErrorKind;
+
+use anyhow::{bail, Result};
+use async_recursion::async_recursion;
+use tokio::io::AsyncReadExt;
 
 use crate::resp_protocol::RespValue;
 
@@ -9,79 +12,99 @@ const SIMPLE_STRING_MAGIC: u8 = '+' as u8;
 const BULK_STRING_MAGIC: u8 = '$' as u8;
 const ARRAY_MAGIC: u8 = '*' as u8;
 
-pub struct Decoder<R: Read> {
-    iter: std::io::Bytes<R>,
+pub struct Decoder<R>
+where
+    R: AsyncReadExt + Unpin + Send,
+{
+    reader: R,
 }
 
-impl<R: Read> Decoder<R> {
-    pub fn new(stream: R) -> Self {
-        Self {
-            iter: stream.bytes(),
-        }
+impl<R> Decoder<R>
+where
+    R: AsyncReadExt + Unpin + Send,
+{
+    pub fn new(reader: R) -> Self {
+        Self { reader }
     }
 
-    pub fn decode(&mut self, magic: u8) -> Result<RespValue> {
-        match magic {
-            SIMPLE_STRING_MAGIC => self.decode_simple_string(),
-            BULK_STRING_MAGIC => self.decode_bulk_string(),
-            ARRAY_MAGIC => self.decode_array(),
-            _ => bail!("invalid magic byte: {}", magic),
+    pub async fn next(&mut self) -> Option<Result<RespValue>> {
+        match self.reader.read_u8().await {
+            Ok(magic) => Some(decode_magic(&mut self.reader, magic).await),
+            Err(err) if err.kind() == ErrorKind::UnexpectedEof => None, // no data to read
+            Err(err) => Some(Err(err.into())), // different error, propagate
         }
-    }
-
-    fn decode_simple_string(&mut self) -> Result<RespValue> {
-        Ok(RespValue::SimpleString(self.read_crcf_terminated_string()?))
-    }
-
-    fn decode_bulk_string(&mut self) -> Result<RespValue> {
-        let n = self.read_crcf_terminated_string()?.parse::<usize>()?;
-        let mut string = Vec::with_capacity(n);
-        for _ in 0..n {
-            let b = self
-                .iter
-                .next()
-                .ok_or(anyhow!("missing bulk string data"))??;
-            string.push(b);
-        }
-        // consume CRLF
-        self.iter.next();
-        self.iter.next();
-        Ok(RespValue::BulkString(String::from_utf8(string)?))
-    }
-
-    fn decode_array(&mut self) -> Result<RespValue> {
-        let n = self.read_crcf_terminated_string()?.parse::<usize>()?;
-        let mut elements = Vec::with_capacity(n);
-        for _ in 0..n {
-            let magic = self.iter.next().ok_or(anyhow!("missing array element"))??;
-            elements.push(self.decode(magic)?);
-        }
-        Ok(RespValue::Array(elements))
-    }
-
-    fn read_crcf_terminated_string(&mut self) -> Result<String> {
-        let mut buffer = Vec::new();
-        while let Some(res) = self.iter.next() {
-            buffer.push(res?);
-            let n = buffer.len();
-            if n >= 2 && buffer[n - 2] == '\r' as u8 && buffer[n - 1] == '\n' as u8 {
-                buffer.truncate(n - 2);
-                return Ok(String::from_utf8(buffer)?);
-            }
-        }
-        bail!("incomplete string");
     }
 }
 
-impl<R: Read> Iterator for Decoder<R> {
-    type Item = Result<RespValue>;
+#[async_recursion]
+pub async fn decode<R>(reader: &mut R) -> Result<RespValue>
+where
+    R: AsyncReadExt + Unpin + Send,
+{
+    let magic = reader.read_u8().await?;
+    decode_magic(reader, magic).await
+}
 
-    fn next(&mut self) -> Option<Self::Item> {
-        let first_byte = self.iter.next()?;
-        Some(match first_byte {
-            Ok(magic) => self.decode(magic),
-            Err(err) => Err(err.into()),
-        })
+async fn decode_magic<R>(reader: &mut R, magic: u8) -> Result<RespValue>
+where
+    R: AsyncReadExt + Unpin + Send,
+{
+    match magic {
+        SIMPLE_STRING_MAGIC => decode_simple_string(reader).await,
+        BULK_STRING_MAGIC => decode_bulk_string(reader).await,
+        ARRAY_MAGIC => decode_array(reader).await,
+        magic => bail!("invalid magic byte: {}", magic),
+    }
+}
+
+async fn decode_simple_string<R>(reader: &mut R) -> Result<RespValue>
+where
+    R: AsyncReadExt + Unpin,
+{
+    Ok(RespValue::SimpleString(
+        read_crlf_terminated_string(reader).await?,
+    ))
+}
+
+async fn decode_bulk_string<R>(reader: &mut R) -> Result<RespValue>
+where
+    R: AsyncReadExt + Unpin,
+{
+    let n = read_crlf_terminated_string(reader)
+        .await?
+        .parse::<usize>()?;
+    let mut buffer = vec![0; n + 2]; // includes CRLF
+    reader.read_exact(&mut buffer).await?;
+    buffer.truncate(n); // remove CRLF
+    Ok(RespValue::BulkString(String::from_utf8(buffer)?))
+}
+
+async fn decode_array<R>(reader: &mut R) -> Result<RespValue>
+where
+    R: AsyncReadExt + Unpin + Send,
+{
+    let n = read_crlf_terminated_string(reader)
+        .await?
+        .parse::<usize>()?;
+    let mut elements = Vec::with_capacity(n);
+    for _ in 0..n {
+        elements.push(decode(reader).await?);
+    }
+    Ok(RespValue::Array(elements))
+}
+
+async fn read_crlf_terminated_string<R>(reader: &mut R) -> Result<String>
+where
+    R: AsyncReadExt + Unpin,
+{
+    let mut buffer = Vec::new();
+    loop {
+        buffer.push(reader.read_u8().await?);
+        let n = buffer.len();
+        if n >= 2 && buffer[n - 2] == '\r' as u8 && buffer[n - 1] == '\n' as u8 {
+            buffer.truncate(n - 2);
+            return Ok(String::from_utf8(buffer)?);
+        }
     }
 }
 
@@ -90,47 +113,47 @@ mod tests {
     use super::*;
     use anyhow::Result;
 
-    #[test]
-    fn test_decode_simple_string() -> Result<()> {
+    #[tokio::test]
+    async fn test_decode_simple_string() -> Result<()> {
         let iter = "+PING\r\n".as_bytes();
         let mut decoder = Decoder::new(iter);
-        let decoded = decoder.next().unwrap()?;
+        let decoded = decoder.next().await.unwrap()?;
         assert_eq!(decoded, RespValue::SimpleString("PING".into()));
         Ok(())
     }
 
-    #[test]
-    fn test_decode_bulk_string_empty() -> Result<()> {
+    #[tokio::test]
+    async fn test_decode_bulk_string_empty() -> Result<()> {
         let iter = "$0\r\n\r\n".as_bytes();
         let mut decoder = Decoder::new(iter);
-        let decoded = decoder.next().unwrap()?;
+        let decoded = decoder.next().await.unwrap()?;
         assert_eq!(decoded, RespValue::BulkString("".into()));
         Ok(())
     }
 
-    #[test]
-    fn test_decode_bulk_string() -> Result<()> {
+    #[tokio::test]
+    async fn test_decode_bulk_string() -> Result<()> {
         let iter = "$5\r\nhello\r\n".as_bytes();
         let mut decoder = Decoder::new(iter);
-        let decoded = decoder.next().unwrap()?;
+        let decoded = decoder.next().await.unwrap()?;
         assert_eq!(decoded, RespValue::BulkString("hello".into()));
         Ok(())
     }
 
-    #[test]
-    fn test_decode_array_empty() -> Result<()> {
+    #[tokio::test]
+    async fn test_decode_array_empty() -> Result<()> {
         let iter = "*0\r\n".as_bytes();
         let mut decoder = Decoder::new(iter);
-        let decoded = decoder.next().unwrap()?;
+        let decoded = decoder.next().await.unwrap()?;
         assert_eq!(decoded, RespValue::Array(vec![]));
         Ok(())
     }
 
-    #[test]
-    fn test_decode_array_bulk_strings() -> Result<()> {
+    #[tokio::test]
+    async fn test_decode_array_bulk_strings() -> Result<()> {
         let iter = "*2\r\n$5\r\nhello\r\n$5\r\nworld\r\n".as_bytes();
         let mut decoder = Decoder::new(iter);
-        let decoded = decoder.next().unwrap()?;
+        let decoded = decoder.next().await.unwrap()?;
         assert_eq!(
             decoded,
             RespValue::Array(vec![
